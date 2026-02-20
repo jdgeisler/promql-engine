@@ -5,7 +5,7 @@ package prometheus
 
 import (
 	"context"
-	"sync"
+	"sync/atomic"
 
 	"github.com/thanos-io/promql-engine/warnings"
 
@@ -28,8 +28,17 @@ type seriesSelector struct {
 	matchers []*labels.Matcher
 	hints    storage.SelectHints
 
-	once   sync.Once
-	series []SignedSeries
+	// triggerOnce coordinates series loading without sync.Once so that all
+	// waiting goroutines are woken simultaneously via a channel close rather
+	// than serially through sync.Mutex. This avoids the O(N) Mutex.Unlock
+	// cascade when multiple callers race to load the same selector (e.g.,
+	// multiple filteredSelectors sharing one seriesSelector via the pool).
+	//
+	// State machine: 0 = untriggered, 1 = loading, 2 = done.
+	triggerOnce atomic.Uint32
+	done        chan struct{} // closed (broadcast) when loading is complete
+	loadErr     error
+	series      []SignedSeries
 }
 
 func newSeriesSelector(storage storage.Querier, matchers []*labels.Matcher, hints storage.SelectHints) *seriesSelector {
@@ -37,6 +46,7 @@ func newSeriesSelector(storage storage.Querier, matchers []*labels.Matcher, hint
 		storage:  storage,
 		matchers: matchers,
 		hints:    hints,
+		done:     make(chan struct{}),
 	}
 }
 
@@ -45,12 +55,24 @@ func (o *seriesSelector) Matchers() []*labels.Matcher {
 }
 
 func (o *seriesSelector) GetSeries(ctx context.Context, shard int, numShards int) ([]SignedSeries, error) {
-	var err error
-	o.once.Do(func() { err = o.loadSeries(ctx) })
-	if err != nil {
-		return nil, err
+	if o.triggerOnce.Load() < 2 {
+		if o.triggerOnce.CompareAndSwap(0, 1) {
+			// This goroutine won the race: do the actual load.
+			o.loadErr = o.loadSeries(ctx)
+			close(o.done) // broadcast to all waiting goroutines at once
+			o.triggerOnce.Store(2)
+		} else {
+			// Another goroutine is loading; wait for the broadcast.
+			select {
+			case <-o.done:
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
 	}
-
+	if o.loadErr != nil {
+		return nil, o.loadErr
+	}
 	return seriesShard(o.series, shard, numShards), nil
 }
 
