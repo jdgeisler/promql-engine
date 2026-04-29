@@ -752,6 +752,95 @@ count by (cluster) (
 	}
 }
 
+// TestDistributedExecutionNoPartitionLabels verifies that aggregations are
+// handled correctly when remote engines have no partition labels. Without
+// partition labels, the two-level split (local_agg(dedup(remote_agg(X))))
+// would cause the Deduplicate node to collapse all remote results (which have
+// identical label sets) to a single engine's output. The optimizer must fall
+// back to distributing only the inner expression so the full aggregation can
+// be computed locally over all series from all engines.
+func TestDistributedExecutionNoPartitionLabels(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name     string
+		expr     string
+		expected string
+	}{
+		{
+			name: "sum-rate with no partition labels distributes inner expression",
+			expr: `sum(rate(http_requests_total[5m]))`,
+			expected: `
+sum(dedup(
+  remote(rate(http_requests_total[5m])),
+  remote(rate(http_requests_total[5m]))))`,
+		},
+		{
+			name: "sum by pod with no partition labels distributes inner expression",
+			expr: `sum by (pod) (rate(http_requests_total[5m]))`,
+			expected: `
+sum by (pod) (dedup(
+  remote(rate(http_requests_total[5m])),
+  remote(rate(http_requests_total[5m]))))`,
+		},
+		{
+			name: "count with no partition labels distributes inner expression",
+			expr: `count(http_requests_total)`,
+			expected: `
+sum(dedup(
+  remote(http_requests_total),
+  remote(http_requests_total)))`,
+		},
+		{
+			name: "max with no partition labels distributes inner expression",
+			expr: `max(http_requests_total)`,
+			expected: `
+max(dedup(
+  remote(http_requests_total),
+  remote(http_requests_total)))`,
+		},
+		{
+			name: "avg with no partition labels distributes inner expression",
+			expr: `avg(http_requests_total)`,
+			expected: `
+avg(dedup(
+  remote(http_requests_total),
+  remote(http_requests_total)))`,
+		},
+	}
+
+	// Engines with labelSets that have a "region" label, but explicitly no partition labels.
+	// This simulates e.g. Thanos queriers whose external labels consist entirely of
+	// replica labels, leaving PartitionLabelSets() empty.
+	engines := []api.RemoteEngine{
+		newEngineMockWithExplicitPartition(
+			math.MinInt64, math.MaxInt64,
+			[]labels.Labels{labels.FromStrings("region", "us-east-1")},
+			nil,
+		),
+		newEngineMockWithExplicitPartition(
+			math.MinInt64, math.MaxInt64,
+			[]labels.Labels{labels.FromStrings("region", "us-west-2")},
+			nil,
+		),
+	}
+	for _, tcase := range cases {
+		t.Run(tcase.name, func(t *testing.T) {
+			optimizers := []Optimizer{
+				DistributedExecutionOptimizer{
+					Endpoints: api.NewStaticEndpoints(engines),
+				},
+			}
+			expr, err := parser.ParseExpr(tcase.expr)
+			testutil.Ok(t, err)
+			plan, _ := NewFromAST(expr, &query.Options{Start: time.Unix(0, 0), End: time.Unix(0, 0)}, PlanOptions{})
+			optimizedPlan, warns := plan.Optimize(optimizers)
+			expectedPlan := cleanUp(replacements, tcase.expected)
+			testutil.Equals(t, expectedPlan, optimizedPlan.Root().String())
+			testutil.Assert(t, len(warns) == 0, "expected no warnings, got some")
+		})
+	}
+}
+
 type engineOpts struct {
 	minTime time.Time
 	maxTime time.Time

@@ -37,6 +37,7 @@ import (
 	"github.com/thanos-io/promql-engine/storage"
 
 	"github.com/efficientgo/core/errors"
+	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/promql"
 	"github.com/prometheus/prometheus/promql/parser"
 	promstorage "github.com/prometheus/prometheus/storage"
@@ -366,7 +367,13 @@ func newDeduplication(ctx context.Context, e logicalplan.Deduplicate, scanners s
 
 	operators := make([]model.VectorOperator, len(e.Expressions))
 	for i, expr := range e.Expressions {
-		operator, err := newOperator(ctx, expr, scanners, opts, hints)
+		// Inject the common partition labels for this engine into its results so that
+		// the dedup operator can correctly distinguish series from different engines
+		// even when the underlying stores do not carry those labels in their chunks
+		// (e.g. when a --selector-label is used on an aggregating combined querier
+		// without propagating an equivalent --label all the way down to each store).
+		injectLabels := commonPartitionLabels(expr.Engine.PartitionLabelSets())
+		operator, err := newRemoteExecutionWithInjection(ctx, expr, injectLabels, opts, hints)
 		if err != nil {
 			return nil, err
 		}
@@ -378,6 +385,10 @@ func newDeduplication(ctx context.Context, e logicalplan.Deduplicate, scanners s
 }
 
 func newRemoteExecution(ctx context.Context, e logicalplan.RemoteExecution, opts *query.Options, hints promstorage.SelectHints) (model.VectorOperator, error) {
+	return newRemoteExecutionWithInjection(ctx, e, labels.EmptyLabels(), opts, hints)
+}
+
+func newRemoteExecutionWithInjection(ctx context.Context, e logicalplan.RemoteExecution, injectLabels labels.Labels, opts *query.Options, hints promstorage.SelectHints) (model.VectorOperator, error) {
 	// Create a new remote query scoped to the calculated start time.
 	qry, err := e.Engine.NewRangeQuery(ctx, promql.NewPrometheusQueryOpts(false, opts.LookbackDelta), e.Query, e.QueryRangeStart, e.QueryRangeEnd, opts.Step)
 	if err != nil {
@@ -389,8 +400,39 @@ func newRemoteExecution(ctx context.Context, e logicalplan.RemoteExecution, opts
 	// We need to set the lookback for the selector to 0 since the remote query already applies one lookback.
 	selectorOpts := *opts
 	selectorOpts.LookbackDelta = 0
-	remoteExec := remote.NewExecution(qry, e.QueryRangeStart, e.QueryRangeEnd, e.Engine.LabelSets(), &selectorOpts, hints)
+	remoteExec := remote.NewExecution(qry, e.QueryRangeStart, e.QueryRangeEnd, e.Engine.LabelSets(), injectLabels, &selectorOpts, hints)
 	return exchange.NewConcurrent(remoteExec, 2, opts), nil
+}
+
+// commonPartitionLabels returns the intersection of all non-empty label sets in
+// sets: labels that appear with the same value in every non-empty set.  The
+// result represents the unique partition identity of a remote engine.
+// If no non-empty set exists, or no labels are shared by all of them, an empty
+// Labels is returned.
+func commonPartitionLabels(sets []labels.Labels) labels.Labels {
+	var nonEmpty []labels.Labels
+	for _, s := range sets {
+		if s.Len() > 0 {
+			nonEmpty = append(nonEmpty, s)
+		}
+	}
+	if len(nonEmpty) == 0 {
+		return labels.EmptyLabels()
+	}
+	common := nonEmpty[0]
+	for _, s := range nonEmpty[1:] {
+		if common.Len() == 0 {
+			break
+		}
+		b := labels.NewBuilder(labels.EmptyLabels())
+		common.Range(func(l labels.Label) {
+			if s.Get(l.Name) == l.Value {
+				b.Set(l.Name, l.Value)
+			}
+		})
+		common = b.Labels()
+	}
+	return common
 }
 
 func newDuplicateLabelCheck(ctx context.Context, e *logicalplan.CheckDuplicateLabels, storage storage.Scanners, opts *query.Options, hints promstorage.SelectHints) (model.VectorOperator, error) {

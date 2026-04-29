@@ -32,8 +32,8 @@ type Execution struct {
 	vectorSelector model.VectorOperator
 }
 
-func NewExecution(query promql.Query, queryRangeStart, queryRangeEnd time.Time, engineLabels []labels.Labels, opts *query.Options, _ storage.SelectHints) model.VectorOperator {
-	storage := newStorageFromQuery(query, opts, engineLabels)
+func NewExecution(query promql.Query, queryRangeStart, queryRangeEnd time.Time, engineLabels []labels.Labels, injectLabels labels.Labels, opts *query.Options, _ storage.SelectHints) model.VectorOperator {
+	storage := newStorageFromQuery(query, opts, engineLabels, injectLabels)
 	oper := &Execution{
 		storage:         storage,
 		query:           query,
@@ -82,20 +82,22 @@ func (e *Execution) Samples() *stats.QuerySamples {
 }
 
 type storageAdapter struct {
-	query promql.Query
-	opts  *query.Options
-	lbls  []labels.Labels
+	query        promql.Query
+	opts         *query.Options
+	lbls         []labels.Labels
+	injectLabels labels.Labels
 
 	once   sync.Once
 	err    error
 	series []promstorage.SignedSeries
 }
 
-func newStorageFromQuery(query promql.Query, opts *query.Options, lbls []labels.Labels) *storageAdapter {
+func newStorageFromQuery(query promql.Query, opts *query.Options, lbls []labels.Labels, injectLabels labels.Labels) *storageAdapter {
 	return &storageAdapter{
-		query: query,
-		opts:  opts,
-		lbls:  lbls,
+		query:        query,
+		opts:         opts,
+		lbls:         lbls,
+		injectLabels: injectLabels,
 	}
 }
 
@@ -123,6 +125,7 @@ func (s *storageAdapter) executeQuery(ctx context.Context) {
 	case promql.Matrix:
 		s.series = make([]promstorage.SignedSeries, len(val))
 		for i, series := range val {
+			series.Metric = s.injectMissingLabels(series.Metric)
 			s.series[i] = promstorage.SignedSeries{
 				Signature: uint64(i),
 				Series:    promql.NewStorageSeries(series),
@@ -131,7 +134,7 @@ func (s *storageAdapter) executeQuery(ctx context.Context) {
 	case promql.Vector:
 		s.series = make([]promstorage.SignedSeries, len(val))
 		for i, sample := range val {
-			series := promql.Series{Metric: sample.Metric}
+			series := promql.Series{Metric: s.injectMissingLabels(sample.Metric)}
 			if sample.H == nil {
 				series.Floats = []promql.FPoint{{T: sample.T, F: sample.F}}
 			} else {
@@ -143,6 +146,23 @@ func (s *storageAdapter) executeQuery(ctx context.Context) {
 			}
 		}
 	}
+}
+
+// injectMissingLabels adds injectLabels entries that are not already present in metric.
+// This is used to attach the remote engine's partition labels to result series when the
+// underlying data does not carry those labels (e.g. when selector-labels are used on the
+// combined querier to advertise a partition but the stores themselves are unlabelled).
+func (s *storageAdapter) injectMissingLabels(metric labels.Labels) labels.Labels {
+	if s.injectLabels.Len() == 0 {
+		return metric
+	}
+	b := labels.NewBuilder(metric)
+	s.injectLabels.Range(func(l labels.Label) {
+		if metric.Get(l.Name) == "" {
+			b.Set(l.Name, l.Value)
+		}
+	})
+	return b.Labels()
 }
 
 func (s *storageAdapter) Close() {

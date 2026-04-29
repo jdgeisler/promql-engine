@@ -216,6 +216,27 @@ func (m DistributedExecutionOptimizer) distributeAggregation(aggr *Aggregation, 
 	if aggr.Op == parser.COUNT {
 		localAggregation = parser.SUM
 	}
+
+	// When no engines have partition labels, newRemoteAggregation cannot add any
+	// differentiating labels to the remote query. Every engine would return results
+	// with identical label sets (e.g. {} for a plain sum()), which the Deduplicate
+	// node would collapse to a single engine's output via last-sample-wins – giving
+	// a wildly incorrect final result.
+	//
+	// Fall back to distributing only the inner expression and computing the
+	// aggregation locally so that all series from all engines are included.
+	if !enginesHavePartitionLabels(engines) {
+		innerExpr := aggr.Expr
+		subQueries := m.distributeQuery(&innerExpr, engines, opts, labelRanges)
+		return &Aggregation{
+			Op:       localAggregation,
+			Expr:     subQueries,
+			Param:    aggr.Param,
+			Grouping: aggr.Grouping,
+			Without:  aggr.Without,
+		}
+	}
+
 	remoteAggregation := newRemoteAggregation(aggr, engines)
 	subQueries := m.distributeQuery(&remoteAggregation, engines, opts, labelRanges)
 	return &Aggregation{
@@ -473,12 +494,43 @@ func isAbsent(expr *Node) bool {
 	return call.Func.Name == "absent" || call.Func.Name == "absent_over_time"
 }
 
+// enginesHavePartitionLabels reports whether any of the given engines exposes at
+// least one partition label via PartitionLabelSets. When no engine has partition
+// labels the two-level aggregation split (local_agg(dedup(remote_agg(X)))) is
+// unsafe: every remote engine returns results with identical label sets which the
+// Deduplicate node then collapses to one engine's output.
+func enginesHavePartitionLabels(engines []api.RemoteEngine) bool {
+	for _, e := range engines {
+		for _, lbls := range e.PartitionLabelSets() {
+			if lbls.Len() > 0 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // distributeAvg distributes an avg() aggregation by rewriting it as sum()/count()
 // where each side is distributed independently. This is necessary because averaging
 // averages gives incorrect results - we must sum all values and count all values
 // separately, then divide.
 func (m DistributedExecutionOptimizer) distributeAvg(expr Node, engines []api.RemoteEngine, opts *query.Options, labelRanges labelSetRanges) Node {
 	aggr := expr.(*Aggregation)
+
+	// When no engines expose partition labels the sum/count split would produce
+	// identical label sets from every engine, which Deduplicate collapses to one.
+	// Fall back to distributing the inner expression and computing avg locally.
+	if !enginesHavePartitionLabels(engines) {
+		innerExpr := aggr.Expr
+		subQueries := m.distributeQuery(&innerExpr, engines, opts, labelRanges)
+		return &Aggregation{
+			Op:       parser.AVG,
+			Expr:     subQueries,
+			Param:    aggr.Param,
+			Grouping: aggr.Grouping,
+			Without:  aggr.Without,
+		}
+	}
 
 	sumAggr := *aggr
 	sumAggr.Op = parser.SUM
